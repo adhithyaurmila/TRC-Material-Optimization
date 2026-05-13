@@ -65,7 +65,10 @@ Q = {
 }
 
 BASELINE_COST   = 81_01_473
-BASELINE_CARBON = 36_28_000
+BASELINE_CARBON = 3_55_420   # OPC-baseline EC for the same 6 optimised categories
+                              # (A1–A3, EN 15978). Phase 1 full-building LCA (3,628,000 kgCO₂e)
+                              # covers a wider scope (all elements, rebar, MEP) and is not
+                              # directly comparable; see Section XI scope notes.
 
 # ── Technical descriptions ────────────────────────────────────────────────────
 material_insights = {
@@ -230,11 +233,11 @@ def get_category_df(df, cat):
 # ══════════════════════════════════════════════════════════════════════════════
 # NSGA-II IMPLEMENTATION
 # ══════════════════════════════════════════════════════════════════════════════
-def evaluate(individual, cats, qs):
+def evaluate(individual, cat_dfs, qs):
     """Compute (cost, EC) for a given individual (list of material row indices)."""
     cost, ec = 0.0, 0.0
-    for i, (cat, q) in enumerate(zip(cats, qs)):
-        row = cats[i].iloc[individual[i]]
+    for cat_df, idx, q in zip(cat_dfs, individual, qs):
+        row = cat_df.iloc[idx]
         cost += row['cost'] * q
         ec   += row['ec']   * q
     return cost, ec
@@ -397,10 +400,10 @@ def wsm_best_from_pareto(pareto_pop, pareto_obj, cat_dfs, cat_names, wc, wk):
     row['Z']    = round(best_z, 4)
     return row
 
-# ── TOPSIS on full population ─────────────────────────────────────────────────
-def run_topsis(all_pop, all_obj, cat_dfs, cat_names, wc, wk):
-    costs = np.array([o[0] for o in all_obj])
-    ecs   = np.array([o[1] for o in all_obj])
+# ── TOPSIS on Pareto front ────────────────────────────────────────────────────
+def run_topsis(pareto_pop, pareto_obj, cat_dfs, cat_names, wc, wk):
+    costs = np.array([o[0] for o in pareto_obj])
+    ecs   = np.array([o[1] for o in pareto_obj])
     cn = costs / (np.sqrt((costs**2).sum()) + 1e-9)
     en = ecs   / (np.sqrt((ecs**2).sum())   + 1e-9)
     cw = wc * cn;  ew = wk * en
@@ -408,46 +411,44 @@ def run_topsis(all_pop, all_obj, cat_dfs, cat_names, wc, wk):
     d_neg = np.sqrt((cw - cw.max())**2 + (ew - ew.max())**2)
     ci    = d_neg / (d_pos + d_neg + 1e-9)
     best_idx = int(np.argmax(ci))
-    row = individual_to_row(all_pop[best_idx], cat_dfs, cat_names)
-    row['Cost'] = all_obj[best_idx][0]
-    row['EC']   = all_obj[best_idx][1]
+    row = individual_to_row(pareto_pop[best_idx], cat_dfs, cat_names)
+    row['Cost'] = pareto_obj[best_idx][0]
+    row['EC']   = pareto_obj[best_idx][1]
     row['Ci']   = round(float(ci[best_idx]), 4)
     return row
 
-# ── VIKOR on full population ──────────────────────────────────────────────────
-def run_vikor(all_pop, all_obj, cat_dfs, cat_names, wc, wk, v=0.5):
+# ── VIKOR on Pareto front ─────────────────────────────────────────────────────
+def run_vikor(pareto_pop, pareto_obj, cat_dfs, cat_names, wc, wk, v=0.5):
     """
     VIKOR (Opricovic, 1998).
     Q = v·(S-S*)/(S⁻-S*) + (1-v)·(R-R*)/(R⁻-R*)
     S = weighted sum of normalised gaps; R = max weighted gap.
     Lower Q = better compromise solution.
+    Both criteria are cost-type (minimise): gap = (fj - f_best) / (f_worst - f_best).
     """
-    costs = np.array([o[0] for o in all_obj])
-    ecs   = np.array([o[1] for o in all_obj])
-    # Best and worst
-    f_best = [costs.min(), ecs.min()]
-    f_worst= [costs.max(), ecs.max()]
-    weights = [wc, wk]
+    costs = np.array([o[0] for o in pareto_obj])
+    ecs   = np.array([o[1] for o in pareto_obj])
+    # Best and worst per criterion
+    f_best  = [costs.min(), ecs.min()]
+    f_worst = [costs.max(), ecs.max()]
+    weights  = [wc, wk]
     criteria = [costs, ecs]
-    # Utility (S) and Regret (R)
-    S = np.zeros(len(all_obj))
-    R = np.zeros(len(all_obj))
-    for j, (fj, w) in enumerate(zip(criteria, weights)):
-        gap = (f_best[j] - fj) / (f_best[j] - f_worst[j] + 1e-9)
-        term = w * np.abs(gap)  # both criteria are cost-type (lower is better)
-        # Correct formulation for cost-type: (fj - f_best) / (f_worst - f_best)
-        gap2 = (fj - f_best[j]) / (f_worst[j] - f_best[j] + 1e-9)
-        term2 = w * gap2
-        S += term2
-        R = np.maximum(R, term2)
+    # Utility (S) and Regret (R) — cost-type normalised gap
+    S = np.zeros(len(pareto_obj))
+    R = np.zeros(len(pareto_obj))
+    for fj, w, fb, fw in zip(criteria, weights, f_best, f_worst):
+        gap  = (fj - fb) / (fw - fb + 1e-9)   # 0 = best, 1 = worst
+        term = w * gap
+        S += term
+        R  = np.maximum(R, term)
     S_star, S_neg = S.min(), S.max()
     R_star, R_neg = R.min(), R.max()
     Q = v * (S - S_star) / (S_neg - S_star + 1e-9) + \
         (1 - v) * (R - R_star) / (R_neg - R_star + 1e-9)
     best_idx = int(np.argmin(Q))
-    row = individual_to_row(all_pop[best_idx], cat_dfs, cat_names)
-    row['Cost'] = all_obj[best_idx][0]
-    row['EC']   = all_obj[best_idx][1]
+    row = individual_to_row(pareto_pop[best_idx], cat_dfs, cat_names)
+    row['Cost'] = pareto_obj[best_idx][0]
+    row['EC']   = pareto_obj[best_idx][1]
     row['Q']    = round(float(Q[best_idx]), 4)
     return row
 
@@ -480,11 +481,9 @@ if df is not None:
         unit = "m²" if c == 'flooring' else "m³"
         st.sidebar.markdown(f"- **{CAT_LABELS[c]}:** {Q[c]} {unit}")
     st.sidebar.markdown("---")
-    st.sidebar.markdown("#### 📊 Phase 1 Baseline")
+    st.sidebar.markdown("#### 📊 Baseline")
     st.sidebar.markdown(f"- **Cost:** {fmt_inr(BASELINE_COST)}")
     st.sidebar.markdown(f"- **Carbon:** {fmt_ec(BASELINE_CARBON)}")
-    st.sidebar.caption("A1–A3 per EN 15978 | Kerala PWD DSR 2023-24 + One Click LCA")
-    st.sidebar.markdown("---")
     st.sidebar.markdown("#### ⚙️ NSGA-II Parameters")
     pop_size   = st.sidebar.slider("Population size", 100, 400, 200, 50)
     n_gens     = st.sidebar.slider("Generations", 100, 500, 300, 50)
@@ -503,7 +502,7 @@ if df is not None:
     # MAIN PAGE
     # ══════════════════════════════════════════════════════════════════════════
     st.title("🏛️ Material Optimization Decision Support System")
-    st.markdown("##### BIM-Integrated Multi-Objective Material Optimization | Translational Research Centre")
+    st.markdown("##### BIM-Integrated Multi-Objective Material Optimization")
     st.markdown("*NSGA-II + WSM + TOPSIS + VIKOR*")
     st.markdown("---")
 
@@ -536,7 +535,7 @@ if df is not None:
         '<p class="section-desc">'
         "NSGA-II (Deb et al., 2002 — IEEE Transactions on Evolutionary Computation) is a "
         "fast elitist multi-objective genetic algorithm. It simultaneously minimises both "
-        "cost and embodied carbon across all 6 element-level material categories without "
+        "cost and embodied carbon across all material categories without "
         "requiring weight pre-specification. The algorithm uses non-dominated sorting and "
         "crowding distance to maintain a diverse Pareto-optimal population. The resulting "
         "Pareto front represents all solutions for which no alternative achieves lower cost "
@@ -605,6 +604,7 @@ if df is not None:
     r_cols[2].metric("🌿 Total Embodied Carbon", fmt_ec(best['EC']))
 
     st.markdown("##### 📉 Comparison with Phase 1 Baseline")
+
     cost_chg   = (best['Cost'] - BASELINE_COST)   / BASELINE_COST   * 100
     carbon_chg = (best['EC']   - BASELINE_CARBON) / BASELINE_CARBON * 100
     b_cols = st.columns(4)
@@ -614,6 +614,8 @@ if df is not None:
     b_cols[2].metric("Baseline Carbon",  fmt_ec(BASELINE_CARBON))
     b_cols[3].metric("Optimised Carbon", fmt_ec(best['EC']),
                      delta=f"{carbon_chg:+.1f}%", delta_color="inverse")
+
+
 
     # ── IV. Material Technical Specifications ──────────────────────────────────
     st.markdown("---")
@@ -630,6 +632,7 @@ if df is not None:
         mat = best[cat]
         insight = material_insights.get(mat, f"No technical data for '{mat}'.")
         st.info(f"**{label}** | Quantity: {qty}\n\n**{mat}** — {insight}")
+
 
     # ── V. Pareto Frontier ────────────────────────────────────────────────────
     st.markdown("---")
@@ -775,14 +778,16 @@ if df is not None:
     st.subheader("VIII. TOPSIS Cross-Validation")
     st.markdown(
         '<p class="section-desc">'
-        "TOPSIS (Hwang &amp; Yoon, 1981) is applied across the full NSGA-II final population "
-        "as an independent cross-validation. Each solution is ranked by its closeness coefficient "
+        "TOPSIS (Hwang &amp; Yoon, 1981) is applied to the same NSGA-II Pareto front as an "
+        "independent cross-validation. Each Pareto solution is ranked by its closeness coefficient "
         "Cᵢ = d⁻ / (d⁺ + d⁻), where d⁺ and d⁻ are Euclidean distances from the positive and "
-        "negative ideal solutions. Cᵢ = 1 represents the ideal. Convergence of WSM and TOPSIS "
-        "provides method-level validation of the result."
+        "negative ideal solutions in the weighted normalised objective space. Cᵢ = 1 represents "
+        "the ideal. Applying all three MCDM methods to the identical Pareto front ensures that "
+        "any convergence or divergence reflects genuine agreement between decision models rather "
+        "than differences in the candidate solution set."
         "</p>", unsafe_allow_html=True)
 
-    best_t = run_topsis(a_pop, a_obj, cat_dfs, CATS, wc, wk)
+    best_t = run_topsis(p_pop, p_obj, cat_dfs, CATS, wc, wk)
     t_cols = st.columns(3)
     t_cols[0].metric("🏗️ Struct. Concrete (TOPSIS)", best_t['structural_concrete'])
     t_cols[1].metric("🟦 Slab Concrete (TOPSIS)",    best_t['slab_concrete'])
@@ -807,10 +812,14 @@ if df is not None:
         "sum of normalised gaps from the positive ideal) and a regret measure R (maximum weighted "
         "gap). The parameter v = 0.5 represents balanced group utility and regret. VIKOR is "
         "specifically designed for situations with conflicting criteria — directly applicable "
-        "to cost–carbon trade-offs in sustainable construction. Lower Q = better compromise."
+        "to cost–carbon trade-offs in sustainable construction. Lower Q = better compromise. "
+        "All three MCDM methods (WSM, TOPSIS, VIKOR) operate on the identical Pareto front; "
+        "divergence between methods at intermediate weight values is expected from their differing "
+        "normalisation procedures (linear, Euclidean, and range-based respectively) and is "
+        "analytically documented in Opricovic &amp; Tzeng (2004)."
         "</p>", unsafe_allow_html=True)
 
-    best_v = run_vikor(a_pop, a_obj, cat_dfs, CATS, wc, wk, v=0.5)
+    best_v = run_vikor(p_pop, p_obj, cat_dfs, CATS, wc, wk, v=0.5)
     v_cols = st.columns(3)
     v_cols[0].metric("🏗️ Struct. Concrete (VIKOR)", best_v['structural_concrete'])
     v_cols[1].metric("🟦 Slab Concrete (VIKOR)",    best_v['slab_concrete'])
@@ -833,7 +842,13 @@ if df is not None:
         "the NSGA-II Pareto front constitutes method-level validation. "
         "Where all three agree, the recommendation is robust to the choice of decision model. "
         "Divergence identifies the sensitivity boundary and is analytically reported per "
-        "Opricovic &amp; Tzeng (2004)."
+        "Opricovic &amp; Tzeng (2004). Because all three methods operate on the same Pareto "
+        "front, convergence reflects genuine agreement in decision logic: WSM uses linear "
+        "range normalisation, TOPSIS uses Euclidean vector normalisation, and VIKOR uses "
+        "range-based utility–regret decomposition. Full convergence at weight extremes "
+        "is expected, as the dominant solution is unambiguous at those "
+        "points; partial divergence at intermediate weights reflects the different "
+        "normalisation sensitivities and is not a methodological inconsistency."
         "</p>", unsafe_allow_html=True)
 
     cats_check = CATS
@@ -939,7 +954,15 @@ unaccounted transport contributions.
 Kerala PWD DSR 2023-24: material + labour. Site overhead, contractor profit,
 GST (18%), and contingencies excluded.
 
-**6. NSGA-II Convergence**
+**6. Carbon Baseline Scope**
+The optimisation baseline carbon (3,55,420 kgCO₂e) is computed from the same 6 material
+categories using OPC/conventional specifications (A1–A3 per EN 15978), ensuring a
+like-for-like comparison with optimised results. The Phase 1 full-building LCA figure
+(36,28,000 kgCO₂e) encompasses all structural elements, steel reinforcement, MEP systems,
+and A4–A5 construction stages; direct percentage comparison with Phase 2 optimised values
+is therefore not valid and should not be made.
+
+**7. NSGA-II Convergence**
 Population size 200, generations 300 provide good convergence for this problem scale.
 Increasing to 400/500 may marginally improve Pareto front density.
         """)
